@@ -10,6 +10,7 @@ from src.models import Resume, Job
 from loguru import logger
 from src.match_scorer import MatchScorer
 import tempfile
+from src.candidate_matcher import CandidateMatcher
 
 # Load environment variables
 load_dotenv()
@@ -24,6 +25,7 @@ resume_processor = ResumeProcessor()
 job_processor = JobProcessor()
 vector_store = VectorStore()
 match_scorer = MatchScorer()
+candidate_matcher = CandidateMatcher()  # Add persistent matcher instance
 
 
 def save_uploaded_file(uploaded_file, temp_dir):
@@ -155,6 +157,31 @@ async def process_resumes(resume_files):
     return results
 
 
+async def find_candidate_matches(job: Job, csv_path: str, top_k: int = 5):
+    """Find best matching candidates for a job"""
+    try:
+        logger.info(f"Finding matches for job: {job.title}")
+        matcher = CandidateMatcher()
+
+        # Load candidates
+        candidates_df = matcher.load_candidates(csv_path)
+        if candidates_df.empty:
+            logger.error("No candidates loaded")
+            return []
+
+        # Find matches
+        matches = await matcher.find_matches(job, candidates_df, top_k)
+
+        # Generate LinkedIn messages
+        for match in matches:
+            match['linkedin_message'] = matcher.generate_linkedin_message(job, match)
+
+        return matches
+    except Exception as e:
+        logger.error(f"Error finding candidate matches: {e}")
+        return []
+
+
 def main():
     st.set_page_config(
         page_title="Resume-Job Matcher",
@@ -165,7 +192,7 @@ def main():
     st.title("🤝 Resume-Job Matcher")
 
     # Create tabs for different functionalities
-    tab1, tab2 = st.tabs(["Job Data Ingestion", "Resume Matching"])
+    tab1, tab2, tab3 = st.tabs(["Job Data Ingestion", "Resume Matching", "Candidate Search"])
 
     with tab1:
         st.header("Step 1: Upload Job Data")
@@ -268,9 +295,7 @@ def main():
                                 use_container_width=True
                             )
 
-                            # Resume Summary
-                            st.markdown("### Resume Summary")
-                            st.write(results[0]['resume_summary'])
+                            st.markdown("---")
 
                             # Detailed View
                             st.subheader("Detailed Analysis")
@@ -299,6 +324,10 @@ def main():
                                 for area in result['areas_for_improvement']:
                                     st.markdown(f"- {area}")
 
+                                # Resume Summary
+                                st.markdown("### Resume Summary")
+                                st.markdown(result['resume_summary'])
+
                                 st.markdown("---")
                         else:
                             st.info("""
@@ -311,6 +340,187 @@ def main():
                     except Exception as e:
                         st.error(f"Error processing resume: {str(e)}")
                         logger.error(f"Error processing resume: {e}")
+
+    with tab3:
+        st.header("Step 3: Candidate Search")
+        st.markdown("""
+        1. First, ingest candidate data (this will clear any existing data)
+        2. Then, search for matching candidates based on job details
+        """)
+
+        # Step 1: Data Ingestion
+        st.subheader("1. Data Ingestion")
+
+        # Toggle for data ingestion
+        ingest_new_data = st.toggle(
+            "Enable Data Ingestion",
+            value=False,
+            help="Toggle ON to ingest new candidate data. This will clear any existing data."
+        )
+
+        if ingest_new_data:
+            candidates_file = st.file_uploader(
+                "Upload candidate database (CSV)",
+                type=["csv"],
+                help="Upload the Juicebox export CSV file containing candidate data."
+            )
+
+            if candidates_file:
+                # Show the file details
+                st.info(f"File uploaded: {candidates_file.name}")
+
+                # Add Process button
+                if st.button("Process Data", type="primary"):
+                    with st.spinner("Processing candidate data..."):
+                        try:
+                            # Save uploaded file
+                            with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp_file:
+                                tmp_file.write(candidates_file.getvalue())
+                                csv_path = tmp_file.name
+
+                            # Clear existing data from vector store
+                            vector_store.clear_namespace(vector_store.namespaces["candidate_search"])
+                            logger.info("Cleared existing candidate data")
+
+                            # Load and store new candidates
+                            df = candidate_matcher.load_candidates(csv_path, ingest_new_data=True)
+
+                            # Clean up temp file
+                            os.unlink(csv_path)
+
+                            if not df.empty:
+                                st.success(f"✅ Successfully ingested {len(df)} candidates")
+
+                                # Display candidate summary
+                                st.markdown("### Database Summary")
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    st.metric("Total Candidates", len(df))
+                                with col2:
+                                    companies = df['Current Org Name'].nunique()
+                                    st.metric("Unique Companies", companies)
+                                with col3:
+                                    titles = df['Current Title'].nunique()
+                                    st.metric("Unique Titles", titles)
+
+                                # Show sample of the data
+                                st.markdown("### Sample Candidates")
+                                sample_df = df[
+                                    ['First name', 'Last name', 'Current Title', 'Current Org Name', 'Location']].head()
+                                st.dataframe(sample_df, use_container_width=True)
+                            else:
+                                st.error("Failed to load candidate data. Please check the file format and try again.")
+                        except Exception as e:
+                            st.error(f"Error processing candidate database: {str(e)}")
+                            logger.error(f"Error processing candidate database: {e}")
+            else:
+                st.info("👆 Please upload your candidate database (CSV) file to proceed.")
+        else:
+            st.info("Toggle ON 'Enable Data Ingestion' to upload new candidate data.")
+
+        # Step 2: Candidate Search
+        st.subheader("2. Candidate Search")
+
+        # Toggle for search functionality
+        enable_search = st.toggle(
+            "Enable Search",
+            value=False,
+            help="Toggle ON to search for matching candidates"
+        )
+
+        if enable_search:
+            # Check if we have data to search against
+            if not candidate_matcher._check_candidates_stored():
+                st.warning("No candidate data available. Please ingest data first.")
+            else:
+                with st.form("job_details_form"):
+                    job_title = st.text_input("Job Title", "Senior Software Engineer")
+                    job_company = st.text_input("Company", "Probook AI")
+                    job_description = st.text_area("Job Description",
+                                                   "Looking for a senior software engineer with experience in Python, ML, and cloud technologies.")
+                    job_location = st.text_input("Location", "San Francisco")
+                    job_salary = st.text_input("Salary Range", "$150,000 - $200,000")
+                    job_requirements = st.text_area("Requirements (one per line)",
+                                                    "Python\nMachine Learning\nAWS\nDocker\nKubernetes")
+
+                    submitted = st.form_submit_button("Find Matching Candidates")
+
+                    if submitted:
+                        with st.spinner("Finding matches..."):
+                            try:
+                                # Create job object
+                                job = Job(
+                                    title=job_title,
+                                    company=job_company,
+                                    description=job_description,
+                                    location=job_location,
+                                    salary=job_salary,
+                                    requirements=[req.strip() for req in job_requirements.split('\n') if req.strip()],
+                                    source="user_input"
+                                )
+
+                                # Find matches using the persistent matcher
+                                matches = asyncio.run(candidate_matcher.find_matches(job))
+
+                                if matches:
+                                    # Step 3: Display Results
+                                    st.subheader("3. Matching Results")
+
+                                    # Create summary table
+                                    summary_data = []
+                                    for match in matches:
+                                        summary_data.append({
+                                            "Name": match['name'],
+                                            "Current Title": match['current_title'],
+                                            "Company": match['current_company'],
+                                            "Match Score": f"{match['match_score']}/10",
+                                            "LinkedIn": match['linkedin']
+                                        })
+
+                                    st.dataframe(
+                                        pd.DataFrame(summary_data),
+                                        column_config={
+                                            "Name": "Name",
+                                            "Current Title": "Current Title",
+                                            "Company": "Company",
+                                            "Match Score": "Match Score",
+                                            "LinkedIn": st.column_config.LinkColumn("LinkedIn Profile")
+                                        },
+                                        hide_index=True,
+                                        use_container_width=True
+                                    )
+
+                                    # Detailed candidate cards
+                                    st.markdown("### Detailed Analysis")
+                                    for match in matches:
+                                        with st.expander(
+                                                f"{match['name']} - {match['current_title']} at {match['current_company']}"):
+                                            col1, col2 = st.columns([2, 1])
+                                            with col1:
+                                                st.markdown(f"**Match Score:** {match['match_score']}/10")
+                                                st.markdown(
+                                                    f"**Current Role:** {match['current_title']} at {match['current_company']}")
+                                                st.markdown(
+                                                    f"**Contact:** [LinkedIn]({match['linkedin']}) | {match['email']} | {match['phone']}")
+                                                st.markdown("**Key Matching Points:**")
+                                                for point in match['key_matching_points']:
+                                                    st.markdown(f"- {point}")
+                                                st.markdown("**Areas for Improvement:**")
+                                                for area in match['areas_for_improvement']:
+                                                    st.markdown(f"- {area}")
+                                            with col2:
+                                                st.markdown("**Suggested LinkedIn Message:**")
+                                                message = candidate_matcher.generate_linkedin_message(job, match)
+                                                st.text_area("", message, height=150, key=f"msg_{match['name']}")
+                                                st.caption(f"{len(message)}/250 characters")
+                                else:
+                                    st.warning("No matching candidates found. Try adjusting the job requirements.")
+
+                            except Exception as e:
+                                st.error(f"Error finding matches: {str(e)}")
+                                logger.error(f"Error in candidate matching: {e}")
+        else:
+            st.info("Toggle ON 'Enable Search' to search for matching candidates.")
 
 
 if __name__ == "__main__":
